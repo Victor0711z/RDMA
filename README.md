@@ -16,7 +16,8 @@
 
 设计细节、每个决策"为什么这么做"，见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 准备简历/面试用的讲解材料在 [`docs/RESUME_BULLETS.md`](docs/RESUME_BULLETS.md)
-和 [`docs/TALKING_POINTS.md`](docs/TALKING_POINTS.md)。
+和 [`docs/TALKING_POINTS.md`](docs/TALKING_POINTS.md)。真机部署的完整过程和踩坑
+记录在 [`docs/DEPLOYMENT_LOG.md`](docs/DEPLOYMENT_LOG.md)。
 
 ## 快速开始（本地演示，不需要任何 RDMA 硬件）
 
@@ -106,13 +107,23 @@ client 和 server 各自一份配置（各自站在自己的视角填 `local_ip`
    连接/改安全组临时封端口，观察恢复耗时），多测几次取平均
 7. **测完立刻释放实例**（不是停止），连同 EIP、云盘一起清理，避免持续扣费
 
-## Benchmark 结果（跑完真机实验后填这里）
+## Benchmark 结果
+
+真机（阿里云 `ecs.g8i.xlarge`，同 VPC 同可用区）跑出来的结果，完整过程和踩过的坑
+见 [`docs/DEPLOYMENT_LOG.md`](docs/DEPLOYMENT_LOG.md)。
 
 | 场景 | 吞吐 | 备注 |
 |---|---|---|
-| 单网卡基线 | | |
-| 双网卡聚合 | | 相比单网卡提升 __% |
-| 故障转移恢复耗时 | | |
+| 单网卡硬件基线（`ib_write_bw -R`） | 平均 1817 MB/s，峰值 3698 MB/s | 约 14.5 Gbit/s 平均，29.6 Gbit/s 峰值 |
+| 单网卡应用层（`dp_client_rdma`，50MiB 文件） | 聚合吞吐 104.45 MB/s | 50 个分片全部成功，0 次故障转移；应用层吞吐远低于硬件基线，主因是逐片 ACK + `window=8` 限制了在途分片数，细节见部署记录 |
+| 双网卡聚合 | 未测（真机只有单网卡，见下方说明） | 双网卡负载均衡/带宽聚合已在本地 TCP loopback 环境验证正确性 |
+| 故障转移恢复耗时 | 未测（真机只有单路径） | 已在本地 TCP loopback 环境验证：故障转移生效、文件完整性校验通过 |
+
+> **关于"双网卡"在真机上的说明**：`ecs.g8i.xlarge` 这个规格一台实例最多只能挂
+> 1 张开启 eRDMA 的网卡（购买页面辅助网卡不支持 eRDMA），所以真机部分只验证了
+> 单路径的硬件正确性和性能基线。多路径负载均衡、故障转移的正确性在本地 TCP
+> loopback 环境完整验证过（见上面"快速开始"一节），架构设计仍然成立，只是
+> 这次真机没有第二张物理网卡可以拿来做真实的多路径聚合测试。
 
 ## 已知限制
 
