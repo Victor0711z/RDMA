@@ -49,6 +49,14 @@ build/dp_server_rdma
 `make test` 只运行不需要 RDMA 设备的 scheduler、CRC32C、配置解析和协议网络序测试；
 它不会运行网络传输。
 
+```bash
+make bench
+```
+
+`make bench` 单独测试 CRC32C。x86 CPU 支持 SSE4.2 时日志应显示
+`backend=sse4.2`，否则自动使用查表实现。优化前真机数据、瓶颈证据和复测方法见
+[`docs/PERFORMANCE_OPTIMIZATION.md`](docs/PERFORMANCE_OPTIMIZATION.md)。
+
 ## 配置
 
 分别复制 [客户端示例](config/client.example.ini) 和

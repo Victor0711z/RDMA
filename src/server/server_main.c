@@ -32,23 +32,16 @@ typedef struct {
     dp_path_t   *path;
     int          idx;
     recv_stats_t *stats;
-    uint32_t     chunk_buf_cap;
 } recv_ctx_t;
 
 static void *recv_thread_fn(void *arg) {
     recv_ctx_t *ctx = (recv_ctx_t *)arg;
-    uint8_t *buf = (uint8_t *)malloc(ctx->chunk_buf_cap);
-    if (!buf) {
-        DP_LOGE("recv: out of memory");
-        dp_path_shutdown(ctx->path);
-        dp_path_close(ctx->path);
-        return NULL;
-    }
 
     int graceful = 0;
     for (;;) {
         uint32_t chunk_id, len;
-        int rc = dp_path_recv_chunk(ctx->path, &chunk_id, buf, ctx->chunk_buf_cap, &len);
+        const void *data;
+        int rc = dp_path_recv_chunk(ctx->path, &chunk_id, &data, &len);
         if (rc == 1) {
             DP_LOGI("QP %d: 收到 DONE / 对端关闭，该 QP 接收结束", ctx->idx);
             graceful = 1;
@@ -80,12 +73,11 @@ static void *recv_thread_fn(void *arg) {
 
         if (!dup) {
             off_t offset = (off_t)chunk_id * (off_t)ctx->stats->chunk_size;
-            ssize_t n = pwrite(ctx->stats->fd, buf, len, offset);
+            ssize_t n = pwrite(ctx->stats->fd, data, len, offset);
             if (n != (ssize_t)len) {
                 DP_LOGE("QP %d: 写文件第 %u 片失败", ctx->idx, chunk_id);
                 dp_path_shutdown(ctx->path);
                 dp_path_close(ctx->path);
-                free(buf);
                 return NULL;
             }
             pthread_mutex_lock(&ctx->stats->lock);
@@ -110,7 +102,6 @@ static void *recv_thread_fn(void *arg) {
         }
     }
 
-    free(buf);
     if (!graceful) dp_path_shutdown(ctx->path);
     dp_path_close(ctx->path);
     return NULL;
@@ -163,6 +154,7 @@ int main(int argc, char **argv) {
 
     dp_config_t cfg;
     if (dp_config_load(config_path, &cfg) != 0) return 1;
+    DP_LOGI("CRC32C backend=%s", dp_crc32c_backend());
 
     DP_LOGI("服务端启动：单 RDMA 设备，%u 个 RC QP，端口 %d..%d，等待连接...",
             cfg.qp_count, cfg.base_port, cfg.base_port + (int)cfg.qp_count - 1);
@@ -293,7 +285,6 @@ int main(int argc, char **argv) {
         rctx[i].path = paths[i];
         rctx[i].idx = i;
         rctx[i].stats = &stats;
-        rctx[i].chunk_buf_cap = cfg.chunk_size;
         if (pthread_create(&recv_tids[i], NULL, recv_thread_fn, &rctx[i]) == 0) {
             recv_started[i] = 1;
         } else {

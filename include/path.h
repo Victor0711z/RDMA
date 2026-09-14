@@ -33,10 +33,19 @@ typedef struct {
     int (*send_hello_ack)(dp_path_t *p, const dp_hello_ack_t *ack);
     int (*recv_hello_ack)(dp_path_t *p, dp_hello_ack_t *ack);
 
-    /* len 为负载字节数；返回 0 成功，<0 失败（连接已断开等） */
+    /* 通用发送接口；len 为负载字节数。 */
     int (*send_chunk)(dp_path_t *p, uint32_t chunk_id, const void *data, uint32_t len);
-    /* 阻塞接收一个分片；buf_cap 必须 >= 协商好的 chunk_size */
-    int (*recv_chunk)(dp_path_t *p, uint32_t *chunk_id, void *buf, uint32_t buf_cap, uint32_t *out_len);
+
+    /*
+     * 零拷贝发送接口：先预留一个已注册 slot，调用方直接把文件读入 payload，
+     * 再 commit 计算 CRC/填写 header/post WRITE。读取失败时必须 release。
+     */
+    int  (*acquire_chunk_buffer)(dp_path_t *p, uint32_t chunk_id, uint32_t len, void **payload);
+    int  (*commit_chunk)(dp_path_t *p, uint32_t chunk_id, uint32_t len);
+    void (*release_chunk_buffer)(dp_path_t *p, uint32_t chunk_id);
+
+    /* 返回服务端注册 slot 内的 payload 视图；该指针在发送对应 ACK 前有效。 */
+    int (*recv_chunk)(dp_path_t *p, uint32_t *chunk_id, const void **data, uint32_t *out_len);
 
     int (*send_ack)(dp_path_t *p, uint32_t chunk_id);
     /* 阻塞接收一个 ACK/DONE；*is_done 用于区分收到的是普通 ACK 还是 DONE */
@@ -72,7 +81,18 @@ static inline int dp_path_recv_hello(dp_path_t *p, dp_hello_t *h) { return p->op
 static inline int dp_path_send_hello_ack(dp_path_t *p, const dp_hello_ack_t *a) { return p->ops->send_hello_ack(p, a); }
 static inline int dp_path_recv_hello_ack(dp_path_t *p, dp_hello_ack_t *a) { return p->ops->recv_hello_ack(p, a); }
 static inline int dp_path_send_chunk(dp_path_t *p, uint32_t id, const void *d, uint32_t l) { return p->ops->send_chunk(p, id, d, l); }
-static inline int dp_path_recv_chunk(dp_path_t *p, uint32_t *id, void *b, uint32_t c, uint32_t *ol) { return p->ops->recv_chunk(p, id, b, c, ol); }
+static inline int dp_path_acquire_chunk_buffer(dp_path_t *p, uint32_t id, uint32_t len, void **payload) {
+    return p->ops->acquire_chunk_buffer(p, id, len, payload);
+}
+static inline int dp_path_commit_chunk(dp_path_t *p, uint32_t id, uint32_t len) {
+    return p->ops->commit_chunk(p, id, len);
+}
+static inline void dp_path_release_chunk_buffer(dp_path_t *p, uint32_t id) {
+    p->ops->release_chunk_buffer(p, id);
+}
+static inline int dp_path_recv_chunk(dp_path_t *p, uint32_t *id, const void **data, uint32_t *ol) {
+    return p->ops->recv_chunk(p, id, data, ol);
+}
 static inline int dp_path_send_ack(dp_path_t *p, uint32_t id) { return p->ops->send_ack(p, id); }
 static inline int dp_path_recv_ack(dp_path_t *p, uint32_t *id, int *is_done) { return p->ops->recv_ack(p, id, is_done); }
 static inline int dp_path_send_done(dp_path_t *p) { return p->ops->send_done(p); }

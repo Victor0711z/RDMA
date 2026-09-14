@@ -85,6 +85,8 @@ typedef struct {
     uint32_t         remote_slot_size;
     uint32_t         remote_num_slots;
     uint64_t         next_send_wr_id;
+    pthread_mutex_t  tx_lock;     /* send CQ、WR id、控制发送缓冲区 */
+    int              tx_lock_initialized;
     pthread_mutex_t  slot_lock;
     int              slot_lock_initialized;
     uint8_t         *slot_in_use;
@@ -168,6 +170,11 @@ static int post_ctrl_recv(rdma_impl_t *impl, uint32_t ring_idx) {
 /* 同步发送一条控制消息：拷贝进 ctrl_send_buf、post SEND、等它完成 */
 static int ctrl_send(rdma_impl_t *impl, const void *data, uint32_t len) {
     if (len > CTRL_MSG_SIZE) { DP_LOGE("rdma: ctrl 消息过大 (%u > %d)", len, CTRL_MSG_SIZE); return -1; }
+    pthread_mutex_lock(&impl->tx_lock);
+    if (impl->broken) {
+        pthread_mutex_unlock(&impl->tx_lock);
+        return -1;
+    }
     memcpy(impl->ctrl_send_buf, data, len);
     struct ibv_sge sge = { .addr = (uintptr_t)impl->ctrl_send_buf, .length = len, .lkey = impl->ctrl_send_mr->lkey };
     uint64_t wr_id = ++impl->next_send_wr_id;
@@ -176,8 +183,16 @@ static int ctrl_send(rdma_impl_t *impl, const void *data, uint32_t len) {
         .sg_list = &sge, .num_sge = 1,
     };
     struct ibv_send_wr *bad;
-    if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) { impl->broken = 1; return -1; }
-    if (poll_send_wr(impl, wr_id) != 0) return -1;
+    if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) {
+        impl->broken = 1;
+        pthread_mutex_unlock(&impl->tx_lock);
+        return -1;
+    }
+    if (poll_send_wr(impl, wr_id) != 0) {
+        pthread_mutex_unlock(&impl->tx_lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&impl->tx_lock);
     return 0;
 }
 
@@ -237,6 +252,7 @@ static void destroy_impl(rdma_impl_t *impl, int graceful) {
     if (impl->cm_id) rdma_destroy_id(impl->cm_id);
     if (impl->ec) rdma_destroy_event_channel(impl->ec);
     if (impl->slot_lock_initialized) pthread_mutex_destroy(&impl->slot_lock);
+    if (impl->tx_lock_initialized) pthread_mutex_destroy(&impl->tx_lock);
     free(impl);
 }
 
@@ -259,6 +275,12 @@ static int wait_cm_event(struct rdma_event_channel *ec, enum rdma_cm_event_type 
 }
 
 static int setup_qp_and_buffers(rdma_impl_t *impl) {
+    if (pthread_mutex_init(&impl->tx_lock, NULL) != 0) {
+        DP_LOGE("rdma: 初始化发送锁失败");
+        return -1;
+    }
+    impl->tx_lock_initialized = 1;
+
     impl->send_cq = ibv_create_cq(impl->cm_id->verbs, impl->window + impl->ctrl_recv_depth + 16, NULL, NULL, 0);
     impl->recv_cq = ibv_create_cq(impl->cm_id->verbs, impl->window + impl->ctrl_recv_depth + 16, NULL, NULL, 0);
     if (!impl->send_cq || !impl->recv_cq) { DP_LOGE("rdma: ibv_create_cq 失败"); return -1; }
@@ -541,9 +563,10 @@ static int rdma_recv_hello_ack(dp_path_t *p, dp_hello_ack_t *ack) {
     return 0;
 }
 
-static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, uint32_t len) {
+static int rdma_acquire_chunk_buffer(dp_path_t *p, uint32_t chunk_id, uint32_t len,
+                                     void **payload) {
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
-    drain_send_cq(impl);
+    if (!payload || impl->is_server || !impl->slot_lock_initialized) return -1;
     if (impl->broken) return -1;
     if (len > impl->chunk_size || impl->remote_num_slots == 0) return -1;
 
@@ -563,14 +586,50 @@ static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, ui
         return -1;
     }
     uint8_t *slot_base = impl->local_slots + (size_t)slot * local_slot_size(impl);
+    *payload = slot_base + sizeof(dp_rdma_slot_hdr_t);
+    return 0;
+}
+
+static void rdma_release_chunk_buffer(dp_path_t *p, uint32_t chunk_id) {
+    rdma_impl_t *impl = (rdma_impl_t *)p->impl;
+    if (impl->is_server || !impl->slot_lock_initialized) return;
+    pthread_mutex_lock(&impl->slot_lock);
+    for (uint32_t i = 0; i < impl->remote_num_slots; i++) {
+        if (impl->slot_in_use[i] && impl->slot_chunk[i] == chunk_id) {
+            impl->slot_in_use[i] = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&impl->slot_lock);
+}
+
+static int rdma_commit_chunk(dp_path_t *p, uint32_t chunk_id, uint32_t len) {
+    rdma_impl_t *impl = (rdma_impl_t *)p->impl;
+    if (impl->is_server || !impl->slot_lock_initialized || len > impl->chunk_size) {
+        rdma_release_chunk_buffer(p, chunk_id);
+        return -1;
+    }
+
+    uint32_t slot = impl->remote_num_slots;
+    pthread_mutex_lock(&impl->slot_lock);
+    for (uint32_t i = 0; i < impl->remote_num_slots; i++) {
+        if (impl->slot_in_use[i] && impl->slot_chunk[i] == chunk_id) {
+            slot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&impl->slot_lock);
+    if (slot == impl->remote_num_slots) return -1;
+
+    uint8_t *slot_base = impl->local_slots + (size_t)slot * local_slot_size(impl);
+    const uint8_t *payload = slot_base + sizeof(dp_rdma_slot_hdr_t);
     dp_rdma_slot_hdr_t slot_hdr = {
         .magic = htonl(DP_MAGIC),
         .chunk_id = htonl(chunk_id),
         .length = htonl(len),
-        .crc32c = htonl(dp_crc32c(data, len)),
+        .crc32c = htonl(dp_crc32c(payload, len)),
     };
     memcpy(slot_base, &slot_hdr, sizeof(slot_hdr));
-    memcpy(slot_base + sizeof(slot_hdr), data, len);
 
     struct ibv_sge sge = {
         .addr = (uintptr_t)slot_base,
@@ -579,7 +638,6 @@ static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, ui
     };
     struct ibv_send_wr wr;
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = ++impl->next_send_wr_id;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
@@ -588,18 +646,34 @@ static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, ui
     wr.wr.rdma.remote_addr = impl->remote_addr + (uint64_t)slot * impl->remote_slot_size;
     wr.wr.rdma.rkey = impl->remote_rkey;
 
-    struct ibv_send_wr *bad;
-    if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) {
-        pthread_mutex_lock(&impl->slot_lock);
-        impl->slot_in_use[slot] = 0;
-        pthread_mutex_unlock(&impl->slot_lock);
-        impl->broken = 1;
+    pthread_mutex_lock(&impl->tx_lock);
+    drain_send_cq(impl);
+    if (impl->broken) {
+        pthread_mutex_unlock(&impl->tx_lock);
+        rdma_release_chunk_buffer(p, chunk_id);
         return -1;
     }
+    wr.wr_id = ++impl->next_send_wr_id;
+    struct ibv_send_wr *bad;
+    if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) {
+        impl->broken = 1;
+        pthread_mutex_unlock(&impl->tx_lock);
+        rdma_release_chunk_buffer(p, chunk_id);
+        return -1;
+    }
+    pthread_mutex_unlock(&impl->tx_lock);
     return 0;
 }
 
-static int rdma_recv_chunk(dp_path_t *p, uint32_t *chunk_id, void *buf, uint32_t buf_cap, uint32_t *out_len) {
+static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, uint32_t len) {
+    void *payload;
+    if (rdma_acquire_chunk_buffer(p, chunk_id, len, &payload) != 0) return -1;
+    memcpy(payload, data, len);
+    return rdma_commit_chunk(p, chunk_id, len);
+}
+
+static int rdma_recv_chunk(dp_path_t *p, uint32_t *chunk_id, const void **data,
+                           uint32_t *out_len) {
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
     for (;;) {
         struct ibv_wc wc;
@@ -630,7 +704,7 @@ static int rdma_recv_chunk(dp_path_t *p, uint32_t *chunk_id, void *buf, uint32_t
             uint32_t expected_crc = ntohl(slot_hdr.crc32c);
             uint64_t total_chunks = impl->file_size / impl->xfer_chunk_size +
                 (impl->file_size % impl->xfer_chunk_size != 0);
-            if (magic != DP_MAGIC || cid >= total_chunks || len > impl->xfer_chunk_size || len > buf_cap) {
+            if (magic != DP_MAGIC || cid >= total_chunks || len > impl->xfer_chunk_size) {
                 DP_LOGE("rdma: 非法 slot header slot=%u chunk=%u len=%u", slot, cid, len);
                 return -1;
             }
@@ -648,12 +722,11 @@ static int rdma_recv_chunk(dp_path_t *p, uint32_t *chunk_id, void *buf, uint32_t
                 DP_LOGE("rdma: 分片 %u CRC32C 错误 (%08x != %08x)", cid, actual_crc, expected_crc);
                 return -1;
             }
-            memcpy(buf, payload, len);
-
             /* SEND 与 WRITE_WITH_IMM 共用 RQ；始终补回同构、带缓冲区的 WQE。 */
             if (post_ctrl_recv(impl, (uint32_t)wc.wr_id) != 0) return -1;
 
             *chunk_id = cid;
+            *data = payload;
             *out_len = len;
             return 0;
         } else if (wc.opcode == IBV_WC_RECV) {
@@ -717,7 +790,9 @@ static void rdma_shutdown(dp_path_t *p) {
     if (!p || !p->impl) return;
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
     impl->broken = 1;
+    if (impl->tx_lock_initialized) pthread_mutex_lock(&impl->tx_lock);
     if (impl->cm_id) (void)rdma_disconnect(impl->cm_id);
+    if (impl->tx_lock_initialized) pthread_mutex_unlock(&impl->tx_lock);
 }
 
 static void rdma_close(dp_path_t *p) {
@@ -736,6 +811,9 @@ static const dp_path_ops_t g_rdma_ops = {
     .send_hello_ack = rdma_send_hello_ack,
     .recv_hello_ack = rdma_recv_hello_ack,
     .send_chunk = rdma_send_chunk,
+    .acquire_chunk_buffer = rdma_acquire_chunk_buffer,
+    .commit_chunk = rdma_commit_chunk,
+    .release_chunk_buffer = rdma_release_chunk_buffer,
     .recv_chunk = rdma_recv_chunk,
     .send_ack = rdma_send_ack,
     .recv_ack = rdma_recv_ack,

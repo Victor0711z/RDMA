@@ -29,6 +29,7 @@
 #include <libgen.h>
 #include <limits.h>
 #include <time.h>
+#include <stdatomic.h>
 
 typedef struct {
     int idx;
@@ -53,8 +54,8 @@ typedef struct {
     int *failed;
     int inject_qp;
     uint32_t inject_after;
-    uint64_t sends_posted;
-    int injection_done;
+    _Atomic uint64_t sends_posted;
+    _Atomic int injection_done;
 } sender_ctx_t;
 
 typedef struct {
@@ -81,16 +82,6 @@ static void mark_failed(dp_path_t *path, scheduler_t *s, pthread_mutex_t *lock,
 
 static void *sender_thread_fn(void *arg) {
     sender_ctx_t *ctx = (sender_ctx_t *)arg;
-    uint8_t *buf = (uint8_t *)malloc(ctx->chunk_size);
-    if (!buf) {
-        DP_LOGE("sender: out of memory");
-        for (int i = 0; i < ctx->num_paths; i++) {
-            mark_failed(ctx->paths[i], ctx->sched, ctx->fail_lock, ctx->failed, i,
-                        "sender out of memory");
-        }
-        return NULL;
-    }
-
     for (;;) {
         if (scheduler_all_done(ctx->sched)) break;
         if (!scheduler_has_live_path(ctx->sched)) {
@@ -105,22 +96,33 @@ static void *sender_thread_fn(void *arg) {
             continue;
         }
 
-        if (!ctx->injection_done && ctx->inject_qp == path_idx &&
-            ctx->sends_posted >= ctx->inject_after) {
-            ctx->injection_done = 1;
-            DP_LOGW("故障注入：第 %llu 次成功发送后主动关闭 QP %d",
-                    (unsigned long long)ctx->sends_posted, path_idx);
-            mark_failed(ctx->paths[path_idx], ctx->sched, ctx->fail_lock, ctx->failed,
-                        path_idx, "requested fault injection");
-            continue;
+        uint64_t posted = atomic_load_explicit(&ctx->sends_posted, memory_order_relaxed);
+        if (ctx->inject_qp == path_idx && posted >= ctx->inject_after) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&ctx->injection_done, &expected, 1)) {
+                DP_LOGW("故障注入：第 %llu 次成功发送后主动关闭 QP %d",
+                        (unsigned long long)posted, path_idx);
+                mark_failed(ctx->paths[path_idx], ctx->sched, ctx->fail_lock, ctx->failed,
+                            path_idx, "requested fault injection");
+                continue;
+            }
         }
 
         uint64_t offset = (uint64_t)chunk_id * ctx->chunk_size;
         uint64_t remain = ctx->file_size - offset;
         uint32_t len = (uint32_t)(remain < ctx->chunk_size ? remain : ctx->chunk_size);
 
-        ssize_t n = pread(ctx->file_fd, buf, len, (off_t)offset);
+        void *payload = NULL;
+        if (dp_path_acquire_chunk_buffer(ctx->paths[path_idx], chunk_id, len, &payload) != 0) {
+            mark_failed(ctx->paths[path_idx], ctx->sched, ctx->fail_lock, ctx->failed,
+                        path_idx, "cannot reserve registered slot");
+            continue;
+        }
+
+        /* 直接读入已注册 MR 的 payload，省掉“临时缓冲区 -> MR slot”的一次 memcpy。 */
+        ssize_t n = pread(ctx->file_fd, payload, len, (off_t)offset);
         if (n != (ssize_t)len) {
+            dp_path_release_chunk_buffer(ctx->paths[path_idx], chunk_id);
             DP_LOGE("sender: 读文件第 %u 片失败 (offset=%llu len=%u)", chunk_id,
                     (unsigned long long)offset, len);
             /* 本地 I/O 是会话级错误，换 QP 重试没有意义，终止所有 QP。 */
@@ -131,15 +133,13 @@ static void *sender_thread_fn(void *arg) {
             break;
         }
 
-        if (dp_path_send_chunk(ctx->paths[path_idx], chunk_id, buf, len) != 0) {
+        if (dp_path_commit_chunk(ctx->paths[path_idx], chunk_id, len) != 0) {
             mark_failed(ctx->paths[path_idx], ctx->sched, ctx->fail_lock, ctx->failed,
                         path_idx, "send error");
         } else {
-            ctx->sends_posted++;
+            atomic_fetch_add_explicit(&ctx->sends_posted, 1, memory_order_relaxed);
         }
     }
-
-    free(buf);
     return NULL;
 }
 
@@ -294,6 +294,7 @@ int main(int argc, char **argv) {
 
     dp_config_t cfg;
     if (dp_config_load(config_path, &cfg) != 0) return 1;
+    DP_LOGI("CRC32C backend=%s", dp_crc32c_backend());
     if (qp_count_override) {
         cfg.qp_count = qp_count_override;
         if ((uint32_t)cfg.base_port + cfg.qp_count - 1u > 65535u) {
@@ -443,11 +444,24 @@ int main(int argc, char **argv) {
         .inject_qp = inject_qp,
         .inject_after = inject_after,
     };
-    pthread_t sender_tid;
-    int sender_started = pthread_create(&sender_tid, NULL, sender_thread_fn, &sctx) == 0;
-    if (!sender_started) {
-        DP_LOGW("无法创建 sender 线程，改为主线程同步发送");
+    /* 每个 QP 配一个发送 worker。scheduler 仍统一决定 chunk -> QP 映射，
+     * 同一 QP 的 post_send 由 rdma_path 内部 tx_lock 串行化。 */
+    pthread_t sender_tids[DP_MAX_PATHS];
+    int sender_started[DP_MAX_PATHS] = {0};
+    int num_sender_workers = 0;
+    for (uint32_t i = 0; i < cfg.qp_count; i++) {
+        if (pthread_create(&sender_tids[i], NULL, sender_thread_fn, &sctx) == 0) {
+            sender_started[i] = 1;
+            num_sender_workers++;
+        } else {
+            DP_LOGW("无法创建 sender worker %u", i);
+        }
+    }
+    if (num_sender_workers == 0) {
+        DP_LOGW("无法创建 sender worker，改为主线程同步发送");
         sender_thread_fn(&sctx);
+    } else {
+        DP_LOGI("已启动 %d 个并行 sender worker", num_sender_workers);
     }
 
     for (;;) {
@@ -464,7 +478,9 @@ int main(int argc, char **argv) {
     /* 必须在终态被 ACK 线程唤醒时取时间，不能把 500ms 进度轮询算进传输耗时。 */
     double data_elapsed = dp_now_sec() - t0;
 
-    if (sender_started) pthread_join(sender_tid, NULL);
+    for (uint32_t i = 0; i < cfg.qp_count; i++) {
+        if (sender_started[i]) pthread_join(sender_tids[i], NULL);
+    }
 
     int success = scheduler_all_done(&sched);
     if (success) {

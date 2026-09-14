@@ -30,4 +30,7 @@ int dp_open_output_file(const char *path, uint64_t size);
 
 uint32_t dp_crc32c(const void *data, size_t len);
 
+/* 当前实际选择的 CRC32C 实现，便于基准测试确认是否使用硬件加速。 */
+const char *dp_crc32c_backend(void);
+
 #endif /* DUALPATH_UTIL_H */
