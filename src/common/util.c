@@ -102,7 +102,7 @@ static uint32_t crc32c_table(const void *data, size_t len) {
     return ~crc;
 }
 
-#if defined(__x86_64__) || defined(__i386__)
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(DP_CRC32C_FORCE_TABLE)
 __attribute__((target("sse4.2")))
 static uint32_t crc32c_sse42(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
