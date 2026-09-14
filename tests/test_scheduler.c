@@ -2,6 +2,32 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+
+enum { CONCURRENT_CHUNKS = 10000, CONCURRENT_THREADS = 8 };
+
+typedef struct {
+    scheduler_t *sched;
+    _Atomic unsigned char *seen;
+} concurrent_ctx_t;
+
+static void *concurrent_worker(void *arg) {
+    concurrent_ctx_t *ctx = (concurrent_ctx_t *)arg;
+    for (;;) {
+        int path;
+        uint32_t chunk;
+        if (scheduler_acquire(ctx->sched, &path, &chunk, 1024) == 0) {
+            assert(chunk < CONCURRENT_CHUNKS);
+            assert(atomic_fetch_add(&ctx->seen[chunk], 1) == 0);
+            scheduler_on_ack(ctx->sched, path, chunk, 1024);
+            continue;
+        }
+        if (scheduler_all_done(ctx->sched)) break;
+        (void)scheduler_wait_for_work(ctx->sched, 10);
+    }
+    return NULL;
+}
 
 static void test_weighted_distribution(void) {
     scheduler_t s;
@@ -68,10 +94,31 @@ static void test_credit_spreads_work_across_qps(void) {
     scheduler_destroy(&s);
 }
 
+static void test_concurrent_acquire_and_ack(void) {
+    scheduler_t s;
+    assert(scheduler_init(&s, 4, NULL, CONCURRENT_CHUNKS, 64) == 0);
+    _Atomic unsigned char *seen = calloc(CONCURRENT_CHUNKS, sizeof(*seen));
+    assert(seen != NULL);
+    for (uint32_t i = 0; i < CONCURRENT_CHUNKS; i++) atomic_init(&seen[i], 0);
+
+    concurrent_ctx_t ctx = { .sched = &s, .seen = seen };
+    pthread_t tids[CONCURRENT_THREADS];
+    for (int i = 0; i < CONCURRENT_THREADS; i++) {
+        assert(pthread_create(&tids[i], NULL, concurrent_worker, &ctx) == 0);
+    }
+    for (int i = 0; i < CONCURRENT_THREADS; i++) pthread_join(tids[i], NULL);
+
+    assert(scheduler_all_done(&s));
+    for (uint32_t i = 0; i < CONCURRENT_CHUNKS; i++) assert(atomic_load(&seen[i]) == 1);
+    free(seen);
+    scheduler_destroy(&s);
+}
+
 int main(void) {
     test_weighted_distribution();
     test_failover_and_late_ack();
     test_credit_spreads_work_across_qps();
+    test_concurrent_acquire_and_ack();
     puts("scheduler tests: OK");
     return 0;
 }

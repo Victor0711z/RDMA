@@ -14,7 +14,7 @@ SERVER_SRC = src/server/server_main.c
 RDMA_CFLAGS := $(shell pkg-config --cflags libibverbs librdmacm 2>/dev/null)
 RDMA_LIBS   := $(shell pkg-config --libs libibverbs librdmacm 2>/dev/null)
 
-.PHONY: all rdma test clean check-rdma-deps
+.PHONY: all rdma test bench clean check-rdma-deps
 
 all: rdma
 
@@ -42,17 +42,27 @@ $(BUILD_DIR)/test_scheduler: tests/test_scheduler.c src/common/scheduler.c | $(B
 $(BUILD_DIR)/test_crc32c: tests/test_crc32c.c src/common/util.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lpthread
 
+$(BUILD_DIR)/test_crc32c_table: tests/test_crc32c.c src/common/util.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -DDP_CRC32C_FORCE_TABLE -o $@ $^ -lpthread
+
 $(BUILD_DIR)/test_config: tests/test_config.c src/common/config.c src/common/util.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lpthread
 
 $(BUILD_DIR)/test_protocol: tests/test_protocol.c src/common/protocol.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^
 
-test: $(BUILD_DIR)/test_scheduler $(BUILD_DIR)/test_crc32c $(BUILD_DIR)/test_config $(BUILD_DIR)/test_protocol
+$(BUILD_DIR)/bench_crc32c: tests/bench_crc32c.c src/common/util.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $^ -lpthread
+
+test: $(BUILD_DIR)/test_scheduler $(BUILD_DIR)/test_crc32c $(BUILD_DIR)/test_crc32c_table $(BUILD_DIR)/test_config $(BUILD_DIR)/test_protocol
 	./$(BUILD_DIR)/test_scheduler
 	./$(BUILD_DIR)/test_crc32c
+	./$(BUILD_DIR)/test_crc32c_table
 	./$(BUILD_DIR)/test_config
 	./$(BUILD_DIR)/test_protocol
+
+bench: $(BUILD_DIR)/bench_crc32c
+	./$(BUILD_DIR)/bench_crc32c
 
 clean:
 	rm -rf $(BUILD_DIR)
