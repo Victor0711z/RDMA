@@ -2,4 +2,8 @@ build/
 *.o
 *.log
 *.bin
+*.pem
+*.key
+client.ini
+server.ini
 !config/*.ini

@@ -2,12 +2,18 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 int scheduler_init(scheduler_t *s, int num_paths, const double *weights,
                     uint32_t total_chunks, uint32_t window_per_path) {
-    if (num_paths <= 0 || num_paths > SCHED_MAX_PATHS) return -1;
+    if (num_paths <= 0 || num_paths > SCHED_MAX_PATHS || window_per_path == 0) return -1;
     memset(s, 0, sizeof(*s));
-    pthread_mutex_init(&s->lock, NULL);
+    if (pthread_mutex_init(&s->lock, NULL) != 0) return -1;
+    if (pthread_cond_init(&s->state_cv, NULL) != 0) {
+        pthread_mutex_destroy(&s->lock);
+        return -1;
+    }
 
     s->num_paths = num_paths;
     s->total_chunks = total_chunks;
@@ -24,9 +30,8 @@ int scheduler_init(scheduler_t *s, int num_paths, const double *weights,
         s->paths[i].credit = window_per_path;
     }
 
-    s->retry_cap = (int)total_chunks + 1;
-    if (s->retry_cap < 1) s->retry_cap = 1;
-    s->retry_queue = (uint32_t *)calloc((size_t)s->retry_cap, sizeof(uint32_t));
+    s->retry_cap = total_chunks > 0 ? (size_t)total_chunks : 1;
+    s->retry_queue = (uint32_t *)calloc(s->retry_cap, sizeof(uint32_t));
     s->retry_head = s->retry_tail = s->retry_count = 0;
 
     s->chunk_owner = (int8_t *)malloc((size_t)total_chunks > 0 ? total_chunks : 1);
@@ -43,6 +48,7 @@ void scheduler_destroy(scheduler_t *s) {
     free(s->chunk_owner);
     s->retry_queue = NULL;
     s->chunk_owner = NULL;
+    pthread_cond_destroy(&s->state_cv);
     pthread_mutex_destroy(&s->lock);
 }
 
@@ -109,6 +115,7 @@ void scheduler_on_ack(scheduler_t *s, int path_idx, uint32_t chunk_id, uint32_t 
         p->bytes_acked += chunk_bytes;
         p->chunks_acked++;
         s->chunks_done++;
+        pthread_cond_broadcast(&s->state_cv);
     }
     /* 否则：这是一个迟到的 / 针对已被故障转移分片的重复 ACK，直接忽略 */
     pthread_mutex_unlock(&s->lock);
@@ -139,6 +146,9 @@ void scheduler_mark_down(scheduler_t *s, int path_idx) {
     p->inflight = 0;
     p->credit = 0;
 
+    /* QP 状态和 retry_queue 都发生了变化，唤醒 sender 与终态等待者。 */
+    pthread_cond_broadcast(&s->state_cv);
+
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -157,6 +167,75 @@ bool scheduler_has_live_path(scheduler_t *s) {
     }
     pthread_mutex_unlock(&s->lock);
     return live;
+}
+
+int scheduler_wait_terminal(scheduler_t *s, uint32_t timeout_ms) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return -1;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&s->lock);
+    int terminal = (s->chunks_done == s->total_chunks);
+    if (!terminal) {
+        bool any_live = false;
+        for (int i = 0; i < s->num_paths; i++) {
+            if (s->paths[i].state == PATH_UP) { any_live = true; break; }
+        }
+        terminal = !any_live;
+    }
+    int rc = 0;
+    while (!terminal && rc == 0) {
+        rc = pthread_cond_timedwait(&s->state_cv, &s->lock, &deadline);
+        terminal = (s->chunks_done == s->total_chunks);
+        if (!terminal) {
+            bool any_live = false;
+            for (int i = 0; i < s->num_paths; i++) {
+                if (s->paths[i].state == PATH_UP) { any_live = true; break; }
+            }
+            terminal = !any_live;
+        }
+    }
+    pthread_mutex_unlock(&s->lock);
+    if (terminal) return 1;
+    return rc == ETIMEDOUT ? 0 : -1;
+}
+
+int scheduler_wait_for_work(scheduler_t *s, uint32_t timeout_ms) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return -1;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&s->lock);
+    int rc = 0;
+    for (;;) {
+        bool terminal = (s->chunks_done == s->total_chunks);
+        bool pending = s->retry_count > 0 || s->next_chunk_id < s->total_chunks;
+        bool usable = false;
+        bool live = false;
+        for (int i = 0; i < s->num_paths; i++) {
+            if (s->paths[i].state != PATH_UP) continue;
+            live = true;
+            if (s->paths[i].credit > 0) usable = true;
+        }
+        if (terminal || !live || (pending && usable)) {
+            pthread_mutex_unlock(&s->lock);
+            return 1;
+        }
+        rc = pthread_cond_timedwait(&s->state_cv, &s->lock, &deadline);
+        if (rc != 0) break;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return rc == ETIMEDOUT ? 0 : -1;
 }
 
 void scheduler_snapshot(scheduler_t *s, sched_path_t *out, int max_paths, int *out_n) {

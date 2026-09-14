@@ -82,7 +82,15 @@ int dp_open_output_file(const char *path, uint64_t size) {
     return fd;
 }
 
-uint32_t dp_calc_total_chunks(uint64_t file_size, uint32_t chunk_size) {
-    if (chunk_size == 0) return 0;
-    return (uint32_t)((file_size + chunk_size - 1) / chunk_size);
+uint32_t dp_crc32c(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint32_t crc = 0xffffffffu;
+    while (len--) {
+        crc ^= *p++;
+        for (int bit = 0; bit < 8; bit++) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
+            crc = (crc >> 1) ^ (0x82f63b78u & mask);
+        }
+    }
+    return ~crc;
 }

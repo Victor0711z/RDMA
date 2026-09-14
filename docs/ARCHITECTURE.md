@@ -1,57 +1,91 @@
 # 架构说明
 
-## 总体结构
+## 目标与边界
 
+系统运行在两台各有一张 RDMA 网卡的主机上。每个进程在同一个 RDMA 设备上建立
+多个 RC QP，通过队列并行研究 WQE/CQ、窗口和调度行为。它是 multi-QP，不是
+multi-NIC；所有 QP 共享 HCA 和物理链路。
+
+## 线程和状态
+
+```text
+client                                      server
+┌─────────────────────────┐                 ┌─────────────────────────┐
+│ 1 sender                │                 │ QP0 recv thread         │
+│ scheduler + pread       │                 │ validate + pwrite + ACK │
+└────────────┬────────────┘                 ├─────────────────────────┤
+             │ choose live QP with credit   │ QP1 recv thread         │
+   ┌─────────┼─────────┐                    │ validate + pwrite + ACK │
+   │         │         │                    ├─────────────────────────┤
+  QP0       QP1      QP(N-1) ─────────────▶ │ ...                     │
+   │         │         │                    └─────────────────────────┘
+ ack0      ack1     ack(N-1)
+   └─────────┴─────────┘
+        release credit/slot
 ```
-                        client 进程                                server 进程
-                 ┌───────────────────────┐                  ┌───────────────────────┐
-                 │      scheduler.c       │                  │   (无调度逻辑，纯"哑"接收) │
-                 │  加权调度 + 故障转移记录  │                  └───────────┬───────────┘
-                 └──────────┬────────────┘                              │
-                             │ 决定"下一个分片走哪条 path"                   │
-                 ┌──────────┴────────────┐                              │
-                 │   1 个 sender 线程      │                              │
-                 │（串行调度，天然避免多线程   │                              │
-                 │  同时写同一条连接的问题） │                              │
-                 └──────────┬────────────┘                              │
-           ┌─────────────────┼─────────────────┐               ┌────────┴────────┐
-           │                                    │               │                 │
-      path0 (网卡A)                        path1 (网卡B)     path0 接收线程    path1 接收线程
-   ack 线程(读ACK)                       ack 线程(读ACK)      (读分片,写文件,回ACK) (同左)
-           │                                    │               │                 │
-           └──────────────tcp 或 rdma────────────┘               └───────tcp 或 rdma┘
+
+每个逻辑 chunk 在 scheduler 中只有三类状态：未分配、归属于某个 QP 且未 ACK、已完成。
+`chunk_owner[]` 是重分配和忽略迟到 ACK 的依据。失败 QP 名下的 chunk 被放进环形
+`retry_queue`，随后只能由仍为 UP 且有 credit 的 QP 获取。
+
+当所有 QP 的窗口都满时，sender 不做固定间隔轮询，而是在 scheduler 条件变量上
+休眠；ACK 释放 credit 或 QP 故障产生 retry 工作时再唤醒，减少空闲 CPU 消耗。
+
+## 建链与内存注册
+
+每个 QP 独立执行 RDMA CM 地址解析、路由解析、QP 创建和连接。服务端为该 QP 注册：
+
+```text
+recv_slots MR = window × (slot_header + chunk_size)
 ```
 
-- **调度算法**（`src/common/scheduler.c`）和**具体怎么把字节发出去**
-  （`src/tcp/tcp_path.c` / `src/rdma/rdma_path.c`）通过 `include/path.h`
-  这一层接口彻底解耦，互不感知对方细节。
-- client 侧：**1 个 sender 线程**负责所有路径的发送（串行调用调度器 +
-  发送，天然避免"两个线程同时往同一条连接写数据导致协议帧交错"的并发 bug）；
-  **每条路径各 1 个 ack 线程**负责读该路径的确认消息，读失败就触发故障转移。
-- server 侧：**每条路径各 1 个接收线程**，各自独立收分片、写文件（用
-  `pwrite` 按偏移量写，多线程写同一个 fd 的不同偏移在 Linux 上是安全的）、
-  回 ACK；线程之间不需要互相协调。
+MR 具有 `LOCAL_WRITE | REMOTE_WRITE` 权限。服务端通过 SEND 把基址、rkey、slot 大小和
+slot 数发给客户端。客户端也注册同布局的本地 staging slot，作为 RDMA WRITE 的 SGE。
 
-## 线路协议（`include/protocol.h`）
+## slot 协议
 
-1. **握手**（只在 path0/控制通道上做一次）：client 发 `HELLO`（文件名、大小、
-   分片大小、路径数、总分片数），server 建好输出文件后回 `HELLO_ACK`。
-2. **数据传输**（每条路径独立进行）：client 发 `CHUNK`（分片编号+数据），
-   server 收到后写文件、回 `ACK`（分片编号）。
-3. **收尾**：client 确认所有分片都被 ACK 后，在每条还存活的路径上发
-   `DONE`；server 收到 `DONE` 就结束该路径的接收线程，并在关闭连接前发一个
-   `BYE`，client 的 ack 线程收到 `BYE` 就正常退出。
+```text
+offset  size  field
+0       4     magic
+4       4     chunk_id
+8       4     payload length
+12      4     CRC32C
+16      N     payload
+```
 
-TCP 后端里，`CHUNK`/`ACK` 等消息的数值字段都转换成网络字节序（大端）传输，
-这样即使 client/server 跑在不同字节序的机器上也能正确通信。
+四个 header 字段使用网络字节序。WRITE_WITH_IMM 的 32 位 immediate data 只传 slot
+下标，因此 chunk_id 可完整使用 32 位。服务端收到 `IBV_WC_RECV_RDMA_WITH_IMM` 后：
 
-## RDMA 后端的额外设计
+1. 检查 slot 下标、magic、chunk_id 范围和长度；
+2. 根据文件大小计算该 chunk 的期望长度；
+3. 对 payload 计算 CRC32C；
+4. 校验通过后复制到线程缓冲区并 `pwrite`；
+5. 去重计数并回 ACK。
 
-RDMA 版本复用同一套 `HELLO`/`ACK`/`DONE` 消息，只是通过 RDMA 的"双边" SEND/RECV
-操作收发；真正的分片数据本体走"单边" RDMA WRITE + Immediate Data（细节和设计
-取舍见 `src/rdma/rdma_path.c` 顶部的大段注释，那里写得比这里详细）。
+## credit 与 slot 生命周期
 
-## 已知限制
+每个 QP 初始有 `window` 个 credit。scheduler 分配一个 chunk 时消耗一个 credit；收到
+该 chunk ACK 时恢复一个 credit。客户端同时维护 `slot_in_use[]` 与 `slot_chunk[]`：
 
-见 `docs/TALKING_POINTS.md` 第 11 条，以及 `src/rdma/rdma_path.c` 顶部注释里的
-"已知限制"部分——面试如果问到"还有什么不足"，直接照那两处说就行，别说"没有"。
+- post WRITE 前原子地认领空闲 slot；
+- ACK 带回 chunk_id，找到对应 slot 后释放；
+- ACK 即使乱序，也不会覆盖仍未确认的 slot；
+- QP 失败后其未 ACK chunk 回到 retry queue，原 QP 不再复用。
+
+## CQ 与 RQ 注意点
+
+- SEND 和 WRITE_WITH_IMM 共用 QP 的 Receive Queue。所有预投递 RECV WQE 都使用同构、
+  足够大的控制缓冲区，避免 DONE 命中零长度 WQE导致 `LOC_LEN_ERR`。
+- 数据 WRITE 使用 signaled WR；发送 CQ 会被持续 drain，控制 SEND 通过唯一 wr_id 等待
+  自己的 completion，避免把更早的数据 completion 当成控制消息完成。
+- client 每个 QP 有一个 ACK 线程；server 每个 QP 有一个接收线程，因此同一 CQ 不会
+  被多个消费者无序竞争。
+
+## 一致性语义
+
+这是 at-least-once 传输加服务端幂等去重：故障边界附近，同一 chunk 可能在旧 QP 已经
+到达、又在新 QP 重发。服务端 `received[chunk_id]` 只让首个成功分片计数，重复内容不
+重复累计。客户端只接受与当前 `chunk_owner` 匹配的 ACK，迟到 ACK 不会重复完成。
+
+当前没有持久化 session/chunk bitmap，所以进程崩溃后不能续传；`session_id` 和协议
+版本字段为后续恢复协议保留了握手位置。

@@ -1,13 +1,8 @@
 /*
- * path.h - “一条网卡上的一条连接”的统一抽象 (transport-agnostic path)
+ * path.h - 一个 RDMA RC QP 的统一抽象
  *
- * client / server / scheduler 的业务逻辑只依赖这一层接口，完全不知道
- * 底层到底是 TCP socket 还是 RDMA queue pair。这样做的好处：
- *   1) 双网卡负载均衡 + 故障转移算法可以脱离 RDMA 硬件独立开发、测试；
- *   2) 在没有 RDMA 网卡的机器上可以用 --transport=tcp 完整跑通整条链路，
- *      作为 CI / 演示 / 本地开发用的“软件模拟双网卡”；
- *   3) 在真实 RDMA 双网卡环境下切换 --transport=rdma 即可获得零拷贝、
- *      内核旁路的真正 RDMA WRITE 数据面，业务代码一行不改。
+ * client / server / scheduler 只依赖这一层接口，RDMA CM 和 Verbs 资源管理
+ * 收敛在 rdma_path.c。一个 dp_path 对应一个独立 RC QP。
  */
 #ifndef DUALPATH_PATH_H
 #define DUALPATH_PATH_H
@@ -16,22 +11,19 @@
 #include <stddef.h>
 #include "protocol.h"
 
-typedef enum { DP_TRANSPORT_TCP = 0, DP_TRANSPORT_RDMA = 1 } dp_transport_t;
-
 typedef struct {
-    const char *local_ip;    /* 绑定的本地 IP（决定走哪张网卡） */
-    const char *remote_ip;   /* 对端 IP（server 侧忽略，仅用于 listen） */
+    const char *local_ip;    /* 本机 RDMA IP */
+    const char *remote_ip;   /* 对端 RDMA IP（server 侧忽略） */
     int         port;
     uint32_t    window_size; /* credit 窗口 / RDMA slot 数量 */
     uint32_t    chunk_size;  /* 单个分片的最大负载字节数 */
-    int         is_control;  /* 是否为控制通道（path 0），仅控制通道传 HELLO */
 } dp_path_cfg_t;
 
 struct dp_path;
 typedef struct dp_path dp_path_t;
 
 typedef struct {
-    const char *name; /* "tcp" / "rdma"，用于日志 */
+    const char *name; /* "rdma"，用于日志 */
 
     dp_path_t *(*client_connect)(const dp_path_cfg_t *cfg);
     dp_path_t *(*server_accept_one)(const dp_path_cfg_t *cfg);
@@ -52,36 +44,27 @@ typedef struct {
 
     int (*send_done)(dp_path_t *p);
 
-    /*
-     * 可选：告知该路径本次传输的 file_size / chunk_size。
-     * TCP 后端不需要这个信息（分片长度已经在帧头里显式传输了），空实现即可。
-     * RDMA 后端需要它：因为 RDMA WRITE 的 immediate data 只有 32 bit，
-     * 塞不下"分片长度"，所以约定 server 收到分片后按 (chunk_id, file_size,
-     * chunk_size) 用和 client 完全相同的公式自己算出这一片应该有多少字节
-     * （公式: min(chunk_size, file_size - chunk_id*chunk_size)），
-     * 双方各自算、结果必然一致，就不需要在线路上额外传这个字段了。
-     */
+    /* 告知 QP 本次传输的 file_size / chunk_size。 */
     void (*set_transfer_meta)(dp_path_t *p, uint64_t file_size, uint32_t chunk_size);
+
+    /* 只中断 I/O、唤醒阻塞线程，不释放对象；随后仍由 close 统一释放。 */
+    void (*shutdown)(dp_path_t *p);
 
     void (*close)(dp_path_t *p);
 } dp_path_ops_t;
 
 struct dp_path {
-    dp_transport_t       type;
     int                  id;      /* 路径编号，方便日志 */
     const dp_path_ops_t *ops;
-    void                *impl;    /* 具体后端(tcp/rdma)的私有状态 */
+    void                *impl;    /* RDMA CM/Verbs 私有状态 */
 };
 
-/* 工厂函数：按 transport 类型创建 client / server 路径 */
-dp_path_t *dp_path_create_client(dp_transport_t type, int path_id, const dp_path_cfg_t *cfg);
-dp_path_t *dp_path_create_server(dp_transport_t type, int path_id, const dp_path_cfg_t *cfg);
+/* 工厂函数：创建 client / server RC QP。 */
+dp_path_t *dp_path_create_client(int qp_id, const dp_path_cfg_t *cfg);
+dp_path_t *dp_path_create_server(int qp_id, const dp_path_cfg_t *cfg);
 
-/* 各后端注册自己的 ops（tcp_path.c / rdma_path.c 中实现） */
-const dp_path_ops_t *dp_tcp_get_ops(void);
-#ifdef DP_ENABLE_RDMA
+/* RDMA 后端注册 ops。 */
 const dp_path_ops_t *dp_rdma_get_ops(void);
-#endif
 
 /* 便捷内联包装，避免上层代码到处写 p->ops->xxx(p, ...) */
 static inline int dp_path_send_hello(dp_path_t *p, const dp_hello_t *h) { return p->ops->send_hello(p, h); }
@@ -96,6 +79,7 @@ static inline int dp_path_send_done(dp_path_t *p) { return p->ops->send_done(p);
 static inline void dp_path_set_transfer_meta(dp_path_t *p, uint64_t fs, uint32_t cs) {
     if (p->ops->set_transfer_meta) p->ops->set_transfer_meta(p, fs, cs);
 }
+static inline void dp_path_shutdown(dp_path_t *p) { if (p && p->ops->shutdown) p->ops->shutdown(p); }
 static inline void dp_path_close(dp_path_t *p) { if (p) p->ops->close(p); }
 
 #endif /* DUALPATH_PATH_H */

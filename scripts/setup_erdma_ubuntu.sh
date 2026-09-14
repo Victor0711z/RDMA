@@ -2,7 +2,7 @@
 # setup_erdma_ubuntu.sh - 在阿里云 eRDMA 机器（Ubuntu）上准备编译环境
 #
 # 用法：把整个项目传到两台 eRDMA 实例上，各自执行一次这个脚本，
-# 然后按 README「真机部署」一节的步骤跑双网卡实验。
+# 然后按 README / docs/RUN_CHECKLIST.md 跑单 HCA 多 QP 实验。
 #
 # 这个脚本只负责"装编译依赖 + 编译 RDMA 版本"，eRDMA 驱动本身要按阿里云官方
 # 文档先装好（一键安装脚本，装完需要重启）：
@@ -35,7 +35,7 @@ echo
 echo "== 完成 =="
 echo "接下来："
 echo "  1) 先用标准工具验证链路: ib_write_bw （server端）/ ib_write_bw <server_ip> （client端）"
-echo "     针对两张网卡的 IP 各测一次，拿到基线带宽"
+echo "     用两台机器的 RDMA IP 测一次，拿到单 HCA 基线带宽"
 echo "  2) 参考 config/client.example.ini / config/server.example.ini 改成两张 ERI 各自的内网 IP"
 echo "  3) ./build/dp_server_rdma -c <server配置> -d <保存目录>"
 echo "     ./build/dp_client_rdma -c <client配置> -f <要传的文件>"

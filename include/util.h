@@ -28,7 +28,6 @@ void dp_format_rate(double bytes_per_sec, char *out, size_t out_len);
 /* 打开/预分配输出文件，返回 fd，失败返回 -1 */
 int dp_open_output_file(const char *path, uint64_t size);
 
-/* 简单的“文件大小 -> 分片数”换算，向上取整 */
-uint32_t dp_calc_total_chunks(uint64_t file_size, uint32_t chunk_size);
+uint32_t dp_crc32c(const void *data, size_t len);
 
 #endif /* DUALPATH_UTIL_H */

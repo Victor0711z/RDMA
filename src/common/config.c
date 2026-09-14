@@ -1,111 +1,130 @@
 #include "config.h"
 #include "util.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+
+#define DP_MAX_CHUNK_SIZE (64u * 1024u * 1024u)
 
 static char *trim(char *s) {
     while (isspace((unsigned char)*s)) s++;
-    if (*s == 0) return s;
+    if (*s == '\0') return s;
     char *end = s + strlen(s) - 1;
-    while (end > s && isspace((unsigned char)*end)) *end-- = 0;
+    while (end > s && isspace((unsigned char)*end)) *end-- = '\0';
     return s;
 }
 
-static int current_path_index(const char *section) {
-    if (strncmp(section, "path", 4) != 0) return -1;
+static int parse_u32(const char *value, uint32_t min, uint32_t max, uint32_t *out) {
+    if (!value[0] || value[0] == '-') return -1;
+    errno = 0;
     char *end = NULL;
-    long idx = strtol(section + 4, &end, 10);
-    if (end == section + 4 || idx < 0 || idx >= DP_MAX_PATHS) return -1;
-    return (int)idx;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || *end != '\0' || parsed < min || parsed > max) return -1;
+    *out = (uint32_t)parsed;
+    return 0;
 }
 
 int dp_config_load(const char *path, dp_config_t *out) {
-    FILE *f = fopen(path, "r");
-    if (!f) {
+    FILE *file = fopen(path, "r");
+    if (!file) {
         DP_LOGE("config: cannot open '%s'", path);
         return -1;
     }
 
     memset(out, 0, sizeof(*out));
-    out->transport = DP_TRANSPORT_TCP;
+    out->base_port = 18801;
+    out->qp_count = 4;
     out->chunk_size = DP_DEFAULT_CHUNK_SIZE;
     out->window = DP_DEFAULT_SLOTS_PER_PATH;
-    out->num_paths = 0;
-    for (int i = 0; i < DP_MAX_PATHS; i++) out->paths[i].weight = 1.0;
 
     char line[512];
-    char section[64] = "general";
-    int max_path_seen = -1;
-
-    while (fgets(line, sizeof(line), f)) {
-        char *l = line;
-        /* 去掉行内注释 (# 或 ; 开头的部分，但保留在字符串外的情况已经足够简单场景使用) */
-        for (char *c = l; *c; c++) {
-            if (*c == '#' || *c == ';') { *c = 0; break; }
+    char section[64] = "rdma";
+    unsigned line_no = 0;
+    const char *bad_key = NULL;
+    const char *bad_value = NULL;
+    while (fgets(line, sizeof(line), file)) {
+        line_no++;
+        for (char *c = line; *c; c++) {
+            if (*c == '#' || *c == ';') {
+                *c = '\0';
+                break;
+            }
         }
-        l = trim(l);
-        if (*l == 0) continue;
+        char *entry = trim(line);
+        if (*entry == '\0') continue;
 
-        if (l[0] == '[') {
-            char *close = strchr(l, ']');
-            if (!close) { DP_LOGE("config: malformed section line '%s'", line); fclose(f); return -1; }
-            *close = 0;
-            snprintf(section, sizeof(section), "%s", l + 1);
-            continue;
-        }
-
-        char *eq = strchr(l, '=');
-        if (!eq) { DP_LOGE("config: malformed line '%s'", line); continue; }
-        *eq = 0;
-        char *key = trim(l);
-        char *val = trim(eq + 1);
-
-        if (strcmp(section, "general") == 0) {
-            if (strcmp(key, "transport") == 0) {
-                if (strcmp(val, "rdma") == 0) out->transport = DP_TRANSPORT_RDMA;
-                else out->transport = DP_TRANSPORT_TCP;
-            } else if (strcmp(key, "chunk_size") == 0) {
-                out->chunk_size = (uint32_t)strtoul(val, NULL, 10);
-            } else if (strcmp(key, "window") == 0) {
-                out->window = (uint32_t)strtoul(val, NULL, 10);
+        if (*entry == '[') {
+            char *close = strchr(entry, ']');
+            if (!close || trim(close + 1)[0] != '\0') {
+                DP_LOGE("config:%u: malformed section", line_no);
+                fclose(file);
+                return -1;
+            }
+            *close = '\0';
+            snprintf(section, sizeof(section), "%s", trim(entry + 1));
+            if (strcmp(section, "rdma") != 0 && strcmp(section, "general") != 0) {
+                DP_LOGE("config:%u: unsupported section [%s]", line_no, section);
+                fclose(file);
+                return -1;
             }
             continue;
         }
 
-        int idx = current_path_index(section);
-        if (idx < 0) {
-            DP_LOGE("config: unknown section [%s]", section);
-            continue;
+        char *equals = strchr(entry, '=');
+        if (!equals) {
+            DP_LOGE("config:%u: expected key=value", line_no);
+            fclose(file);
+            return -1;
         }
-        if (idx > max_path_seen) max_path_seen = idx;
+        *equals = '\0';
+        char *key = trim(entry);
+        char *value = trim(equals + 1);
+        uint32_t parsed;
 
         if (strcmp(key, "local_ip") == 0) {
-            snprintf(out->paths[idx].local_ip, sizeof(out->paths[idx].local_ip), "%s", val);
+            snprintf(out->local_ip, sizeof(out->local_ip), "%s", value);
         } else if (strcmp(key, "remote_ip") == 0) {
-            snprintf(out->paths[idx].remote_ip, sizeof(out->paths[idx].remote_ip), "%s", val);
-        } else if (strcmp(key, "port") == 0) {
-            out->paths[idx].port = atoi(val);
-        } else if (strcmp(key, "weight") == 0) {
-            out->paths[idx].weight = atof(val);
+            snprintf(out->remote_ip, sizeof(out->remote_ip), "%s", value);
+        } else if (strcmp(key, "base_port") == 0) {
+            if (parse_u32(value, 1, 65535, &parsed) != 0) {
+                bad_key = key; bad_value = value; goto invalid_number;
+            }
+            out->base_port = (int)parsed;
+        } else if (strcmp(key, "qp_count") == 0) {
+            if (parse_u32(value, 1, DP_MAX_PATHS, &out->qp_count) != 0) {
+                bad_key = key; bad_value = value; goto invalid_number;
+            }
+        } else if (strcmp(key, "chunk_size") == 0) {
+            if (parse_u32(value, 4096, DP_MAX_CHUNK_SIZE, &out->chunk_size) != 0) {
+                bad_key = key; bad_value = value; goto invalid_number;
+            }
+        } else if (strcmp(key, "window") == 0) {
+            if (parse_u32(value, 1, 256, &out->window) != 0) {
+                bad_key = key; bad_value = value; goto invalid_number;
+            }
         } else {
-            DP_LOGW("config: unknown key '%s' in [%s]", key, section);
-        }
-    }
-    fclose(f);
-
-    out->num_paths = max_path_seen + 1;
-    if (out->num_paths <= 0) {
-        DP_LOGE("config: no [pathN] sections found in '%s'", path);
-        return -1;
-    }
-    for (int i = 0; i < out->num_paths; i++) {
-        if (out->paths[i].local_ip[0] == 0 || out->paths[i].remote_ip[0] == 0 || out->paths[i].port == 0) {
-            DP_LOGE("config: path%d missing local_ip/remote_ip/port", i);
+            DP_LOGE("config:%u: unknown key '%s'", line_no, key);
+            fclose(file);
             return -1;
         }
     }
+    fclose(file);
+
+    if (!out->local_ip[0] || !out->remote_ip[0]) {
+        DP_LOGE("config: local_ip and remote_ip are required");
+        return -1;
+    }
+    if ((uint32_t)out->base_port + out->qp_count - 1u > 65535u) {
+        DP_LOGE("config: base_port + qp_count exceeds 65535");
+        return -1;
+    }
     return 0;
+
+invalid_number:
+    DP_LOGE("config:%u: invalid value '%s' for %s", line_no, bad_value, bad_key);
+    fclose(file);
+    return -1;
 }

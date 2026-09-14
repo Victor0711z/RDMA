@@ -1,7 +1,7 @@
 /*
- * scheduler.h - 双网卡（多路径）分片调度与故障转移算法
+ * scheduler.h - 多 QP 分片调度与故障转移算法
  *
- * 这是整个项目的“大脑”：与传输层（TCP/RDMA）完全解耦，只负责回答
+ * 这是整个项目的“大脑”：管理同一 RDMA 设备上的多个 RC QP，只负责回答
  * 两个问题：
  *   1) 下一个待发送的分片应该走哪条路径？ (加权轮询 / 最小虚拟完成时间)
  *   2) 某条路径挂掉之后，它身上未完成的分片应该如何重新分配？ (故障转移)
@@ -17,6 +17,7 @@
 #define DUALPATH_SCHEDULER_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <pthread.h>
 
@@ -26,7 +27,7 @@ typedef enum { PATH_UP = 0, PATH_DOWN = 1 } path_state_t;
 
 typedef struct {
     int            id;
-    double         weight;        /* 相对权重，例如两张网卡带宽比 25G:10G -> 2.5:1 */
+    double         weight;        /* 相对权重；当前默认各 QP 为 1.0 */
     double         vprogress;     /* 虚拟进度 = bytes_assigned / weight，越小越优先 */
     path_state_t   state;
     uint32_t       credit;        /* 当前可用发送窗口（未确认分片数上限） */
@@ -40,6 +41,7 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t lock;
+    pthread_cond_t  state_cv;        /* ACK、QP 故障或终态变化时唤醒等待线程 */
     sched_path_t    paths[SCHED_MAX_PATHS];
     int             num_paths;
 
@@ -49,7 +51,7 @@ typedef struct {
 
     /* 重传/故障转移队列：一个简单的定长环形缓冲区就够用（chunk 数量有限且是 uint32） */
     uint32_t       *retry_queue;
-    int             retry_head, retry_tail, retry_cap, retry_count;
+    size_t          retry_head, retry_tail, retry_cap, retry_count;
 
     /* 记录每个 chunk 当前分配在哪条路径上，用于故障转移时批量回收 */
     int8_t         *chunk_owner;   /* chunk_owner[chunk_id] = path idx，-1 表示未分配/已完成 */
@@ -78,6 +80,15 @@ bool scheduler_all_done(scheduler_t *s);
 
 /* 是否还存在至少一条存活路径 */
 bool scheduler_has_live_path(scheduler_t *s);
+
+/* 等待传输进入终态（全部 ACK 或无存活路径）；1=终态，0=超时，<0=错误。 */
+int scheduler_wait_terminal(scheduler_t *s, uint32_t timeout_ms);
+
+/*
+ * 等待出现可调度工作（待发送 chunk + 存活且有 credit 的 QP）或进入终态。
+ * 1=状态已变化且应重新检查，0=超时，<0=错误。
+ */
+int scheduler_wait_for_work(scheduler_t *s, uint32_t timeout_ms);
 
 void scheduler_snapshot(scheduler_t *s, sched_path_t *out, int max_paths, int *out_n);
 

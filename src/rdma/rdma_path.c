@@ -7,7 +7,7 @@
  *
  *   1) 控制消息（HELLO / HELLO_ACK / ACK / DONE / BYE / 内部的 slot 元信息）
  *      —— 用标准的"双边"操作 SEND/RECV 实现，跟 socket send/recv 心智模型
- *      基本一致，复用 protocol.h 里跟 TCP 后端完全相同的结构体和网络字节序
+ *      使用 protocol.h 中的控制结构体和统一网络字节序
  *      转换函数。
  *
  *   2) 分片数据本体 —— 用 RDMA WRITE + Immediate Data 实现"单边"零拷贝写：
@@ -15,19 +15,16 @@
  *        slot，每个 slot 能装一个分片），把这块内存的 (addr, rkey) 通过一条
  *        控制消息告诉 client；
  *      - client（发送方）把分片数据 RDMA WRITE 直接写到 server 那块内存里
- *        对应的 slot 上，同时在 immediate data 里带上 (slot 编号, chunk_id)，
+ *        对应的 slot 上；immediate data 只携带 slot 编号，完整 chunk 元数据
+ *        （chunk_id/length/CRC32C）位于 slot header；
  *        server 端不需要 CPU 参与数据搬运（数据由网卡直接 DMA 到目标内存），
  *        只需要有一个预先 post 好的 RECV 来"被通知"数据到了；
- *      - immediate data 只有 32 bit，塞不下"这一片有多少字节"，所以约定
- *        双方各自用 (chunk_id, file_size, chunk_size) 算出同样的长度
- *        （见 path.h 里 set_transfer_meta 的注释），不需要额外传输。
+ *      - server 校验 slot header、期望长度和 CRC32C 后才写文件并回 ACK。
  *
  * slot 复用：每条 path 上，同一时刻最多有 window 个分片在途未 ACK（这是
  * scheduler.c 的 credit 机制保证的），所以 client 侧用一个简单的自增计数器
- * `next_send_slot % window` 选 slot 就足够安全——只有当某个 slot 里的分片被
- * server 处理完并 ACK 回来后，credit 才会被释放、才可能有新的分片被调度到
- * 这条 path 上，而这必然晚于 window 个分片之前那次对同一 slot 的写入完成，
- * 不会出现"新数据还没写完就被下一次写入覆盖"的情况。
+ * client 显式记录每个 slot 当前属于哪个 chunk；只有收到该 chunk 的 ACK 才释放
+ * slot。这样即使 ACK 乱序，也不会用新 WRITE 覆盖仍在处理的远端 slot。
  *
  * ============================== 已知限制 ==============================
  * - 控制通道走双边 SEND/RECV，量大（比如每个分片一个 ACK）时会有一些 CPU
@@ -39,8 +36,6 @@
  *   这两个库只在装了 RDMA 网卡驱动的机器上才有），需要在有 RDMA 环境的机器
  *   上 `make rdma` 编译验证。
  */
-#ifdef DP_ENABLE_RDMA
-
 #include "path.h"
 #include "util.h"
 
@@ -52,6 +47,8 @@
 #include <endian.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
@@ -69,7 +66,7 @@ typedef struct {
     uint32_t window;
     uint32_t chunk_size;
     int      is_server;      /* 0 = client(发送方/WRITE发起者), 1 = server(接收方/WRITE目标) */
-    volatile int broken;     /* 一旦检测到错误，后续调用直接快速失败 */
+    _Atomic int broken;      /* sender/ACK 线程都会访问 */
 
     /* --- 控制消息通道（双边 SEND/RECV），client/server 都要用到 --- */
     uint8_t        *ctrl_recv_buf;   /* ctrl_recv_depth 个 CTRL_MSG_SIZE 大小的环形缓冲区 */
@@ -85,7 +82,13 @@ typedef struct {
     struct ibv_mr   *local_slots_mr;
     uint64_t         remote_addr;
     uint32_t         remote_rkey;
-    uint32_t         next_send_slot;
+    uint32_t         remote_slot_size;
+    uint32_t         remote_num_slots;
+    uint64_t         next_send_wr_id;
+    pthread_mutex_t  slot_lock;
+    int              slot_lock_initialized;
+    uint8_t         *slot_in_use;
+    uint32_t        *slot_chunk;
 
     /* --- server 专用：接收 slot（RDMA WRITE 的目标） --- */
     uint8_t        *recv_slots;
@@ -107,6 +110,10 @@ typedef struct __attribute__((packed)) {
 } dp_slotinfo_t;
 #define DP_MSG_SLOTINFO 100u
 
+static size_t local_slot_size(const rdma_impl_t *impl) {
+    return sizeof(dp_rdma_slot_hdr_t) + (size_t)impl->chunk_size;
+}
+
 /* ---------------------------------------------------------------------- */
 /* 小工具                                                                  */
 /* ---------------------------------------------------------------------- */
@@ -120,12 +127,26 @@ static int poll_cq_blocking(struct ibv_cq *cq, struct ibv_wc *wc) {
     }
 }
 
+/* 同一个 send CQ 同时承载数据 WRITE 和控制 SEND，必须等到自己的 wr_id，不能把
+ * 更早的数据 completion 误当成当前控制消息已经完成。 */
+static int poll_send_wr(rdma_impl_t *impl, uint64_t target_wr_id) {
+    for (;;) {
+        struct ibv_wc wc;
+        if (poll_cq_blocking(impl->send_cq, &wc) != 0) {
+            impl->broken = 1;
+            return -1;
+        }
+        if (wc.wr_id == target_wr_id) return 0;
+    }
+}
+
 /* 非阻塞地把 send_cq 里已经完成的 WR 都收走，主要用来及时发现错误、避免 CQ 堆积 */
 static void drain_send_cq(rdma_impl_t *impl) {
     struct ibv_wc wc;
     for (;;) {
         int n = ibv_poll_cq(impl->send_cq, 1, &wc);
-        if (n <= 0) break;
+        if (n < 0) { impl->broken = 1; break; }
+        if (n == 0) break;
         if (wc.status != IBV_WC_SUCCESS) {
             DP_LOGW("rdma: send completion 出错 status=%d", (int)wc.status);
             impl->broken = 1;
@@ -149,13 +170,14 @@ static int ctrl_send(rdma_impl_t *impl, const void *data, uint32_t len) {
     if (len > CTRL_MSG_SIZE) { DP_LOGE("rdma: ctrl 消息过大 (%u > %d)", len, CTRL_MSG_SIZE); return -1; }
     memcpy(impl->ctrl_send_buf, data, len);
     struct ibv_sge sge = { .addr = (uintptr_t)impl->ctrl_send_buf, .length = len, .lkey = impl->ctrl_send_mr->lkey };
+    uint64_t wr_id = ++impl->next_send_wr_id;
     struct ibv_send_wr wr = {
-        .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED, .sg_list = &sge, .num_sge = 1,
+        .wr_id = wr_id, .opcode = IBV_WR_SEND, .send_flags = IBV_SEND_SIGNALED,
+        .sg_list = &sge, .num_sge = 1,
     };
     struct ibv_send_wr *bad;
     if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) { impl->broken = 1; return -1; }
-    struct ibv_wc wc;
-    if (poll_cq_blocking(impl->send_cq, &wc) != 0) { impl->broken = 1; return -1; }
+    if (poll_send_wr(impl, wr_id) != 0) return -1;
     return 0;
 }
 
@@ -167,7 +189,10 @@ static int ctrl_recv_wait(rdma_impl_t *impl, void *out, uint32_t out_cap, uint32
         do {
             n = ibv_poll_cq(impl->recv_cq, 1, &wc);
             if (n < 0) { impl->broken = 1; return -1; }
-            if (n == 0) usleep(CQ_POLL_BACKOFF_US);
+            if (n == 0) {
+                if (impl->broken) return -1;
+                usleep(CQ_POLL_BACKOFF_US);
+            }
         } while (n == 0);
 
         if (wc.status != IBV_WC_SUCCESS) { impl->broken = 1; return -1; }
@@ -186,6 +211,33 @@ static int ctrl_recv_wait(rdma_impl_t *impl, void *out, uint32_t out_cap, uint32
          * 稳妥起见记录一下然后继续等待，不至于卡死 */
         DP_LOGW("rdma: ctrl_recv_wait 收到非预期的 opcode=%d，忽略", (int)wc.opcode);
     }
+}
+
+static void destroy_impl(rdma_impl_t *impl, int graceful) {
+    if (!impl) return;
+    if (graceful && impl->is_server && impl->cm_id && impl->cm_id->qp && !impl->broken) {
+        dp_ack_hdr_t bye = { .magic = DP_MAGIC, .msg_type = DP_MSG_BYE, .chunk_id = 0, .status = 0 };
+        dp_ack_hdr_hton(&bye);
+        (void)ctrl_send(impl, &bye, sizeof(bye));
+    }
+    if (impl->cm_id && impl->cm_id->qp) rdma_destroy_qp(impl->cm_id);
+    if (impl->local_slots_mr) ibv_dereg_mr(impl->local_slots_mr);
+    if (impl->recv_slots_mr) ibv_dereg_mr(impl->recv_slots_mr);
+    if (impl->ctrl_send_mr) ibv_dereg_mr(impl->ctrl_send_mr);
+    if (impl->ctrl_recv_mr) ibv_dereg_mr(impl->ctrl_recv_mr);
+    free(impl->local_slots);
+    free(impl->slot_in_use);
+    free(impl->slot_chunk);
+    free(impl->recv_slots);
+    free(impl->ctrl_send_buf);
+    free(impl->ctrl_recv_buf);
+    if (impl->send_cq) ibv_destroy_cq(impl->send_cq);
+    if (impl->recv_cq) ibv_destroy_cq(impl->recv_cq);
+    if (impl->pd) ibv_dealloc_pd(impl->pd);
+    if (impl->cm_id) rdma_destroy_id(impl->cm_id);
+    if (impl->ec) rdma_destroy_event_channel(impl->ec);
+    if (impl->slot_lock_initialized) pthread_mutex_destroy(&impl->slot_lock);
+    free(impl);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -227,9 +279,13 @@ static int setup_qp_and_buffers(rdma_impl_t *impl) {
     }
 
     impl->ctrl_recv_buf = (uint8_t *)malloc((size_t)impl->ctrl_recv_depth * CTRL_MSG_SIZE);
+    impl->ctrl_send_buf = (uint8_t *)malloc(CTRL_MSG_SIZE);
+    if (!impl->ctrl_recv_buf || !impl->ctrl_send_buf) {
+        DP_LOGE("rdma: 分配控制消息缓冲区失败");
+        return -1;
+    }
     impl->ctrl_recv_mr = ibv_reg_mr(impl->pd, impl->ctrl_recv_buf,
                                      (size_t)impl->ctrl_recv_depth * CTRL_MSG_SIZE, IBV_ACCESS_LOCAL_WRITE);
-    impl->ctrl_send_buf = (uint8_t *)malloc(CTRL_MSG_SIZE);
     impl->ctrl_send_mr = ibv_reg_mr(impl->pd, impl->ctrl_send_buf, CTRL_MSG_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!impl->ctrl_recv_mr || !impl->ctrl_send_mr) { DP_LOGE("rdma: 注册控制消息 MR 失败"); return -1; }
 
@@ -239,8 +295,9 @@ static int setup_qp_and_buffers(rdma_impl_t *impl) {
     impl->ctrl_recv_next = 0;
 
     if (impl->is_server) {
-        size_t total = (size_t)impl->window * impl->chunk_size;
+        size_t total = (size_t)impl->window * local_slot_size(impl);
         impl->recv_slots = (uint8_t *)malloc(total);
+        if (!impl->recv_slots) { DP_LOGE("rdma: 分配 recv_slots 失败"); return -1; }
         impl->recv_slots_mr = ibv_reg_mr(impl->pd, impl->recv_slots, total,
                                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!impl->recv_slots_mr) {
@@ -250,19 +307,13 @@ static int setup_qp_and_buffers(rdma_impl_t *impl) {
                     "（当前 window=%u chunk_size=%u，共 %zu 字节）", impl->window, impl->chunk_size, total);
             return -1;
         }
-        /* 为每个 slot post 一个 0 字节的"门铃" RECV，专门用来接住 WRITE_WITH_IMM 的通知，
-         * 数据本身由网卡直接 DMA 进 recv_slots，这个 RECV 不搬运任何数据 */
-        for (uint32_t i = 0; i < impl->window; i++) {
-            struct ibv_recv_wr wr = { .wr_id = 0xFFFF0000u | i, .sg_list = NULL, .num_sge = 0 };
-            struct ibv_recv_wr *bad;
-            if (ibv_post_recv(impl->cm_id->qp, &wr, &bad) != 0) {
-                DP_LOGE("rdma: post 门铃 recv 失败");
-                return -1;
-            }
-        }
+        /* WRITE_WITH_IMM 和 SEND 会从同一个 RQ 按序消费 WQE，不能混放零长度“门铃”
+         * 与带缓冲区的控制 WQE，否则 DONE 可能命中零长度 WQE 并触发 LOC_LEN_ERR。
+         * 上面的同构控制 WQE 同时承接两种 completion；WRITE 本体仍写 recv_slots。 */
     } else {
-        size_t total = (size_t)impl->window * impl->chunk_size;
+        size_t total = (size_t)impl->window * local_slot_size(impl);
         impl->local_slots = (uint8_t *)malloc(total);
+        if (!impl->local_slots) { DP_LOGE("rdma: 分配 local_slots 失败"); return -1; }
         impl->local_slots_mr = ibv_reg_mr(impl->pd, impl->local_slots, total, IBV_ACCESS_LOCAL_WRITE);
         if (!impl->local_slots_mr) {
             DP_LOGE("rdma: 注册 local_slots MR 失败 (errno=%d: %s)", errno, strerror(errno));
@@ -271,6 +322,13 @@ static int setup_qp_and_buffers(rdma_impl_t *impl) {
                     "（当前 window=%u chunk_size=%u，共 %zu 字节）", impl->window, impl->chunk_size, total);
             return -1;
         }
+        impl->slot_in_use = (uint8_t *)calloc(impl->window, 1);
+        impl->slot_chunk = (uint32_t *)calloc(impl->window, sizeof(uint32_t));
+        if (!impl->slot_in_use || !impl->slot_chunk || pthread_mutex_init(&impl->slot_lock, NULL) != 0) {
+            DP_LOGE("rdma: 初始化发送 slot 所有权表失败");
+            return -1;
+        }
+        impl->slot_lock_initialized = 1;
     }
     return 0;
 }
@@ -279,6 +337,7 @@ static dp_path_t *wrap(int id, rdma_impl_t *impl);
 
 static dp_path_t *rdma_client_connect(const dp_path_cfg_t *cfg) {
     rdma_impl_t *impl = (rdma_impl_t *)calloc(1, sizeof(*impl));
+    if (!impl) return NULL;
     impl->window = cfg->window_size;
     impl->chunk_size = cfg->chunk_size;
     impl->ctrl_recv_depth = cfg->window_size + 16;
@@ -292,11 +351,18 @@ static dp_path_t *rdma_client_connect(const dp_path_cfg_t *cfg) {
     struct sockaddr_in local_addr, remote_addr;
     memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_family = AF_INET;
-    if (cfg->local_ip && cfg->local_ip[0]) inet_pton(AF_INET, cfg->local_ip, &local_addr.sin_addr);
+    if (cfg->local_ip && cfg->local_ip[0] &&
+        inet_pton(AF_INET, cfg->local_ip, &local_addr.sin_addr) != 1) {
+        DP_LOGE("rdma: invalid local_ip '%s'", cfg->local_ip);
+        goto fail;
+    }
     memset(&remote_addr, 0, sizeof(remote_addr));
     remote_addr.sin_family = AF_INET;
     remote_addr.sin_port = htons((uint16_t)cfg->port);
-    inet_pton(AF_INET, cfg->remote_ip, &remote_addr.sin_addr);
+    if (inet_pton(AF_INET, cfg->remote_ip, &remote_addr.sin_addr) != 1) {
+        DP_LOGE("rdma: invalid remote_ip '%s'", cfg->remote_ip);
+        goto fail;
+    }
 
     if (rdma_resolve_addr(impl->cm_id, (struct sockaddr *)&local_addr, (struct sockaddr *)&remote_addr, 3000) != 0) {
         DP_LOGE("rdma: rdma_resolve_addr 失败: %s", strerror(errno)); goto fail;
@@ -330,6 +396,14 @@ static dp_path_t *rdma_client_connect(const dp_path_cfg_t *cfg) {
     }
     impl->remote_addr = be64toh(si->addr);
     impl->remote_rkey = ntohl(si->rkey);
+    impl->remote_slot_size = ntohl(si->slot_size);
+    uint32_t peer_slots = ntohl(si->num_slots);
+    if (impl->remote_slot_size < local_slot_size(impl) || peer_slots == 0 || peer_slots > 256) {
+        DP_LOGE("rdma: 对端 slot 参数不兼容 (slot_size=%u num_slots=%u，本地需要=%zu)",
+                impl->remote_slot_size, peer_slots, local_slot_size(impl));
+        goto fail;
+    }
+    impl->remote_num_slots = peer_slots < impl->window ? peer_slots : impl->window;
 
     DP_LOGI("rdma path 建链成功 (client): local=%s -> remote=%s:%d, remote slot addr=0x%lx rkey=0x%x",
             cfg->local_ip ? cfg->local_ip : "(any)", cfg->remote_ip, cfg->port,
@@ -337,19 +411,20 @@ static dp_path_t *rdma_client_connect(const dp_path_cfg_t *cfg) {
     return wrap(0, impl);
 
 fail:
-    /* 尽力清理，具体细节见 rdma_close */
+    destroy_impl(impl, 0);
     return NULL;
 }
 
 static dp_path_t *rdma_server_accept_one(const dp_path_cfg_t *cfg) {
     rdma_impl_t *impl = (rdma_impl_t *)calloc(1, sizeof(*impl));
+    if (!impl) return NULL;
     impl->window = cfg->window_size;
     impl->chunk_size = cfg->chunk_size;
     impl->ctrl_recv_depth = cfg->window_size + 16;
     impl->is_server = 1;
 
     impl->ec = rdma_create_event_channel();
-    struct rdma_cm_id *listen_id;
+    struct rdma_cm_id *listen_id = NULL;
     if (!impl->ec || rdma_create_id(impl->ec, &listen_id, NULL, RDMA_PS_TCP) != 0) {
         DP_LOGE("rdma: rdma_create_id (listen) 失败"); goto fail_early;
     }
@@ -359,7 +434,10 @@ static dp_path_t *rdma_server_accept_one(const dp_path_cfg_t *cfg) {
     bind_addr.sin_family = AF_INET;
     bind_addr.sin_port = htons((uint16_t)cfg->port);
     const char *bind_ip = (cfg->local_ip && cfg->local_ip[0]) ? cfg->local_ip : "0.0.0.0";
-    inet_pton(AF_INET, bind_ip, &bind_addr.sin_addr);
+    if (inet_pton(AF_INET, bind_ip, &bind_addr.sin_addr) != 1) {
+        DP_LOGE("rdma: invalid bind ip '%s'", bind_ip);
+        goto fail_listen;
+    }
 
     if (rdma_bind_addr(listen_id, (struct sockaddr *)&bind_addr) != 0) {
         DP_LOGE("rdma: rdma_bind_addr(%s:%d) 失败: %s", bind_ip, cfg->port, strerror(errno));
@@ -387,6 +465,7 @@ static dp_path_t *rdma_server_accept_one(const dp_path_cfg_t *cfg) {
     if (wait_cm_event(impl->ec, RDMA_CM_EVENT_ESTABLISHED, NULL) != 0) { DP_LOGE("rdma: 建链失败"); goto fail; }
 
     rdma_destroy_id(listen_id); /* 已经拿到子连接了，监听 id 不再需要 */
+    listen_id = NULL;
 
     /* 主动把接收缓冲区告诉 client */
     dp_slotinfo_t si;
@@ -395,7 +474,7 @@ static dp_path_t *rdma_server_accept_one(const dp_path_cfg_t *cfg) {
     si.msg_type = htonl(DP_MSG_SLOTINFO);
     si.addr = htobe64((uint64_t)(uintptr_t)impl->recv_slots);
     si.rkey = htonl(impl->recv_slots_mr->rkey);
-    si.slot_size = htonl(impl->chunk_size);
+    si.slot_size = htonl((uint32_t)local_slot_size(impl));
     si.num_slots = htonl(impl->window);
     if (ctrl_send(impl, &si, sizeof(si)) != 0) { DP_LOGE("rdma: 发送 slotinfo 失败"); goto fail; }
 
@@ -404,23 +483,22 @@ static dp_path_t *rdma_server_accept_one(const dp_path_cfg_t *cfg) {
     return wrap(0, impl);
 
 fail:
-    /* 建链失败的清理没有做到完全严谨（例如 setup_qp_and_buffers 里已经注册
-     * 的 MR/分配的 CQ 在这里没有逐一释放）——这条路径只在初始化阶段的极端
-     * 情况下才会走到，且走到这里进程通常也要退出了，为了控制代码复杂度
-     * 这里只做了最基本的清理，没有追求资源零泄漏。 */
-    rdma_destroy_id(listen_id);
-    free(impl);
+    if (listen_id) rdma_destroy_id(listen_id);
+    destroy_impl(impl, 0);
     return NULL;
 fail_listen:
-    rdma_destroy_id(listen_id);
+    if (listen_id) rdma_destroy_id(listen_id);
 fail_early:
-    free(impl);
+    destroy_impl(impl, 0);
     return NULL;
 }
 
 static dp_path_t *wrap(int id, rdma_impl_t *impl) {
     dp_path_t *p = (dp_path_t *)calloc(1, sizeof(dp_path_t));
-    p->type = DP_TRANSPORT_RDMA;
+    if (!p) {
+        destroy_impl(impl, 0);
+        return NULL;
+    }
     p->id = id;
     p->ops = dp_rdma_get_ops();
     p->impl = impl;
@@ -467,28 +545,54 @@ static int rdma_send_chunk(dp_path_t *p, uint32_t chunk_id, const void *data, ui
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
     drain_send_cq(impl);
     if (impl->broken) return -1;
+    if (len > impl->chunk_size || impl->remote_num_slots == 0) return -1;
 
-    uint32_t slot = impl->next_send_slot % impl->window;
-    impl->next_send_slot++;
-    memcpy(impl->local_slots + (size_t)slot * impl->chunk_size, data, len);
+    uint32_t slot = impl->remote_num_slots;
+    pthread_mutex_lock(&impl->slot_lock);
+    for (uint32_t i = 0; i < impl->remote_num_slots; i++) {
+        if (!impl->slot_in_use[i]) {
+            slot = i;
+            impl->slot_in_use[i] = 1;
+            impl->slot_chunk[i] = chunk_id;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&impl->slot_lock);
+    if (slot == impl->remote_num_slots) {
+        DP_LOGE("rdma: QP credit 与 slot 状态不一致（没有可用 slot）");
+        return -1;
+    }
+    uint8_t *slot_base = impl->local_slots + (size_t)slot * local_slot_size(impl);
+    dp_rdma_slot_hdr_t slot_hdr = {
+        .magic = htonl(DP_MAGIC),
+        .chunk_id = htonl(chunk_id),
+        .length = htonl(len),
+        .crc32c = htonl(dp_crc32c(data, len)),
+    };
+    memcpy(slot_base, &slot_hdr, sizeof(slot_hdr));
+    memcpy(slot_base + sizeof(slot_hdr), data, len);
 
     struct ibv_sge sge = {
-        .addr = (uintptr_t)(impl->local_slots + (size_t)slot * impl->chunk_size),
-        .length = len,
+        .addr = (uintptr_t)slot_base,
+        .length = (uint32_t)(sizeof(slot_hdr) + len),
         .lkey = impl->local_slots_mr->lkey,
     };
     struct ibv_send_wr wr;
     memset(&wr, 0, sizeof(wr));
+    wr.wr_id = ++impl->next_send_wr_id;
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-    wr.imm_data = htonl(DP_IMM_ENCODE(slot, chunk_id));
-    wr.wr.rdma.remote_addr = impl->remote_addr + (uint64_t)slot * impl->chunk_size;
+    wr.imm_data = htonl(slot);
+    wr.wr.rdma.remote_addr = impl->remote_addr + (uint64_t)slot * impl->remote_slot_size;
     wr.wr.rdma.rkey = impl->remote_rkey;
 
     struct ibv_send_wr *bad;
     if (ibv_post_send(impl->cm_id->qp, &wr, &bad) != 0) {
+        pthread_mutex_lock(&impl->slot_lock);
+        impl->slot_in_use[slot] = 0;
+        pthread_mutex_unlock(&impl->slot_lock);
         impl->broken = 1;
         return -1;
     }
@@ -503,36 +607,62 @@ static int rdma_recv_chunk(dp_path_t *p, uint32_t *chunk_id, void *buf, uint32_t
         do {
             n = ibv_poll_cq(impl->recv_cq, 1, &wc);
             if (n < 0) return -1;
-            if (n == 0) usleep(CQ_POLL_BACKOFF_US);
+            if (n == 0) {
+                if (impl->broken) return -1;
+                usleep(CQ_POLL_BACKOFF_US);
+            }
         } while (n == 0);
         if (wc.status != IBV_WC_SUCCESS) return -1;
 
         if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-            uint32_t encoded = ntohl(wc.imm_data);
-            uint32_t slot = DP_IMM_SLOT(encoded);
-            uint32_t cid = DP_IMM_CHUNK(encoded);
+            uint32_t slot = ntohl(wc.imm_data);
+            if (slot >= impl->window || impl->xfer_chunk_size == 0) {
+                DP_LOGE("rdma: 非法 slot 通知 slot=%u", slot);
+                return -1;
+            }
+
+            uint8_t *slot_base = impl->recv_slots + (size_t)slot * local_slot_size(impl);
+            dp_rdma_slot_hdr_t slot_hdr;
+            memcpy(&slot_hdr, slot_base, sizeof(slot_hdr));
+            uint32_t magic = ntohl(slot_hdr.magic);
+            uint32_t cid = ntohl(slot_hdr.chunk_id);
+            uint32_t len = ntohl(slot_hdr.length);
+            uint32_t expected_crc = ntohl(slot_hdr.crc32c);
+            uint64_t total_chunks = impl->file_size / impl->xfer_chunk_size +
+                (impl->file_size % impl->xfer_chunk_size != 0);
+            if (magic != DP_MAGIC || cid >= total_chunks || len > impl->xfer_chunk_size || len > buf_cap) {
+                DP_LOGE("rdma: 非法 slot header slot=%u chunk=%u len=%u", slot, cid, len);
+                return -1;
+            }
 
             uint64_t offset = (uint64_t)cid * impl->xfer_chunk_size;
             uint64_t remain = (offset < impl->file_size) ? (impl->file_size - offset) : 0;
-            uint32_t len = (uint32_t)(remain < impl->xfer_chunk_size ? remain : impl->xfer_chunk_size);
-            if (len > buf_cap) { DP_LOGE("rdma: 分片 %u 长度超出缓冲区", cid); return -1; }
-            memcpy(buf, impl->recv_slots + (size_t)slot * impl->chunk_size, len);
+            uint32_t expected_len = (uint32_t)(remain < impl->xfer_chunk_size ? remain : impl->xfer_chunk_size);
+            if (len != expected_len) {
+                DP_LOGE("rdma: 分片 %u 长度不匹配 (%u != %u)", cid, len, expected_len);
+                return -1;
+            }
+            const uint8_t *payload = slot_base + sizeof(slot_hdr);
+            uint32_t actual_crc = dp_crc32c(payload, len);
+            if (actual_crc != expected_crc) {
+                DP_LOGE("rdma: 分片 %u CRC32C 错误 (%08x != %08x)", cid, actual_crc, expected_crc);
+                return -1;
+            }
+            memcpy(buf, payload, len);
 
-            /* 重新 post 这个门铃 slot，让它可以接住后续写到同一个 slot 的下一次 WRITE */
-            struct ibv_recv_wr wr = { .wr_id = wc.wr_id, .sg_list = NULL, .num_sge = 0 };
-            struct ibv_recv_wr *bad;
-            if (ibv_post_recv(impl->cm_id->qp, &wr, &bad) != 0) return -1;
+            /* SEND 与 WRITE_WITH_IMM 共用 RQ；始终补回同构、带缓冲区的 WQE。 */
+            if (post_ctrl_recv(impl, (uint32_t)wc.wr_id) != 0) return -1;
 
             *chunk_id = cid;
             *out_len = len;
             return 0;
         } else if (wc.opcode == IBV_WC_RECV) {
             uint32_t idx = (uint32_t)wc.wr_id;
-            dp_chunk_hdr_t hdr;
+            dp_done_hdr_t hdr;
             if (wc.byte_len < sizeof(hdr)) { post_ctrl_recv(impl, idx); continue; }
             memcpy(&hdr, impl->ctrl_recv_buf + (size_t)idx * CTRL_MSG_SIZE, sizeof(hdr));
             post_ctrl_recv(impl, idx);
-            dp_chunk_hdr_ntoh(&hdr);
+            dp_done_hdr_ntoh(&hdr);
             if (hdr.magic == DP_MAGIC && hdr.msg_type == DP_MSG_DONE) return 1;
             /* 其它意外的控制消息，忽略继续等 */
         }
@@ -553,15 +683,27 @@ static int rdma_recv_ack(dp_path_t *p, uint32_t *chunk_id, int *is_done) {
     if (ctrl_recv_wait(impl, &ack, sizeof(ack), &len) != 0 || len != sizeof(ack)) return -1;
     dp_ack_hdr_ntoh(&ack);
     if (ack.magic != DP_MAGIC) return -1;
-    if (ack.msg_type == DP_MSG_ACK) { *chunk_id = ack.chunk_id; *is_done = 0; return 0; }
+    if (ack.msg_type == DP_MSG_ACK) {
+        pthread_mutex_lock(&impl->slot_lock);
+        for (uint32_t i = 0; i < impl->remote_num_slots; i++) {
+            if (impl->slot_in_use[i] && impl->slot_chunk[i] == ack.chunk_id) {
+                impl->slot_in_use[i] = 0;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&impl->slot_lock);
+        *chunk_id = ack.chunk_id;
+        *is_done = 0;
+        return 0;
+    }
     if (ack.msg_type == DP_MSG_BYE) { *is_done = 1; return 0; }
     return -1;
 }
 
 static int rdma_send_done(dp_path_t *p) {
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
-    dp_chunk_hdr_t hdr = { .magic = DP_MAGIC, .msg_type = DP_MSG_DONE, .chunk_id = 0, .length = 0 };
-    dp_chunk_hdr_hton(&hdr);
+    dp_done_hdr_t hdr = { .magic = DP_MAGIC, .msg_type = DP_MSG_DONE };
+    dp_done_hdr_hton(&hdr);
     return ctrl_send(impl, &hdr, sizeof(hdr));
 }
 
@@ -571,33 +713,17 @@ static void rdma_set_transfer_meta(dp_path_t *p, uint64_t file_size, uint32_t ch
     impl->xfer_chunk_size = chunk_size;
 }
 
+static void rdma_shutdown(dp_path_t *p) {
+    if (!p || !p->impl) return;
+    rdma_impl_t *impl = (rdma_impl_t *)p->impl;
+    impl->broken = 1;
+    if (impl->cm_id) (void)rdma_disconnect(impl->cm_id);
+}
+
 static void rdma_close(dp_path_t *p) {
     if (!p) return;
     rdma_impl_t *impl = (rdma_impl_t *)p->impl;
-    if (impl) {
-        if (impl->cm_id && impl->cm_id->qp && !impl->broken) {
-            dp_ack_hdr_t bye = { .magic = DP_MAGIC, .msg_type = DP_MSG_BYE, .chunk_id = 0, .status = 0 };
-            dp_ack_hdr_hton(&bye);
-            (void)ctrl_send(impl, &bye, sizeof(bye)); /* 尽力而为，失败就算了 */
-        }
-        if (impl->cm_id) {
-            if (impl->cm_id->qp) rdma_destroy_qp(impl->cm_id);
-        }
-        if (impl->local_slots_mr) ibv_dereg_mr(impl->local_slots_mr);
-        if (impl->recv_slots_mr) ibv_dereg_mr(impl->recv_slots_mr);
-        if (impl->ctrl_send_mr) ibv_dereg_mr(impl->ctrl_send_mr);
-        if (impl->ctrl_recv_mr) ibv_dereg_mr(impl->ctrl_recv_mr);
-        free(impl->local_slots);
-        free(impl->recv_slots);
-        free(impl->ctrl_send_buf);
-        free(impl->ctrl_recv_buf);
-        if (impl->send_cq) ibv_destroy_cq(impl->send_cq);
-        if (impl->recv_cq) ibv_destroy_cq(impl->recv_cq);
-        if (impl->pd) ibv_dealloc_pd(impl->pd);
-        if (impl->cm_id) rdma_destroy_id(impl->cm_id);
-        if (impl->ec) rdma_destroy_event_channel(impl->ec);
-        free(impl);
-    }
+    destroy_impl(impl, 1);
     free(p);
 }
 
@@ -615,9 +741,8 @@ static const dp_path_ops_t g_rdma_ops = {
     .recv_ack = rdma_recv_ack,
     .send_done = rdma_send_done,
     .set_transfer_meta = rdma_set_transfer_meta,
+    .shutdown = rdma_shutdown,
     .close = rdma_close,
 };
 
 const dp_path_ops_t *dp_rdma_get_ops(void) { return &g_rdma_ops; }
-
-#endif /* DP_ENABLE_RDMA */
