@@ -232,7 +232,7 @@ int main(int argc, char **argv) {
     hack.magic = DP_MAGIC;
     hack.msg_type = DP_MSG_HELLO_ACK;
     hack.window_size = cfg.window;
-    hack.status = hello_status != 0 ? hello_status : ((fd < 0) ? 1 : 0);
+    hack.status = hello_status != 0 ? (uint32_t)hello_status : ((fd < 0) ? 1u : 0u);
     if (dp_path_send_hello_ack(paths[0], &hack) != 0) {
         DP_LOGE("发送 HELLO_ACK 失败");
         if (fd >= 0) close(fd);
